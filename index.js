@@ -1,7 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const qrcode = require('qrcode');
-const { useSingleFileAuthState, makeWASocket } = require('@whiskeysockets/baileys');
+const { makeInMemoryStore, makeWASocket, useSingleFileAuthState } = require('@whiskeysockets/baileys');
 
 const app = express();
 const port = process.env.PORT || 3000;
