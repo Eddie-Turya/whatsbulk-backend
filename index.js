@@ -1,9 +1,9 @@
-import express from 'express'
-import makeWASocket, { useSingleFileAuthState, DisconnectReason } from '@whiskeysockets/baileys'
-import qrcode from 'qrcode'
-import cors from 'cors'
-import { Boom } from '@hapi/boom'
-import { unlinkSync } from 'fs'
+const express = require('express')
+const { default: makeWASocket, useSingleFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys')
+const qrcode = require('qrcode')
+const cors = require('cors')
+const { Boom } = require('@hapi/boom')
+const fs = require('fs')
 
 const { state, saveState } = useSingleFileAuthState('./session.json')
 
@@ -35,7 +35,7 @@ async function startSock() {
       } else {
         isConnected = false
         try {
-          unlinkSync('./session.json')
+          fs.unlinkSync('./session.json')
         } catch {}
       }
     } else if (connection === 'open') {
