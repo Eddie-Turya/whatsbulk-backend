@@ -1,96 +1,87 @@
-const express = require('express')
-const { default: makeWASocket, useSingleFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys')
-const qrcode = require('qrcode')
-const cors = require('cors')
-const { Boom } = require('@hapi/boom')
-const fs = require('fs')
+const express = require('express');
+const cors = require('cors');
+const qrcode = require('qrcode');
+const { useSingleFileAuthState, makeWASocket } = require('@whiskeysockets/baileys');
 
-const { state, saveState } = useSingleFileAuthState('./session.json')
+const app = express();
+const port = process.env.PORT || 3000;
 
-const app = express()
-app.use(cors())
-app.use(express.json())
+app.use(cors());
+app.use(express.json());
 
-let sock = null
-let isConnected = false
-let qrData = null
+const { state, saveState } = useSingleFileAuthState('./session.json');
+let client = null;
+let qr = null;
+let status = 'disconnected';
 
-async function startSock() {
-  sock = makeWASocket({
-    auth: state,
-    printQRInTerminal: false
-  })
+async function connectToWhatsApp() {
+    client = makeWASocket({
+        auth: state,
+        printQRInTerminal: false,
+        logger: { level: 'silent' }
+    });
 
-  sock.ev.on('connection.update', (update) => {
-    const { connection, lastDisconnect, qr } = update
+    client.ev.on('connection.update', (update) => {
+        const { connection, qr: qrCode } = update;
+        if (qrCode) {
+            qr = qrCode;
+            status = 'pending';
+        }
+        if (connection === 'open') {
+            status = 'connected';
+            qr = null;
+        }
+        if (connection === 'close') {
+            status = 'disconnected';
+            setTimeout(connectToWhatsApp, 5000);
+        }
+    });
 
-    if (qr) {
-      qrData = qr
-    }
-
-    if (connection === 'close') {
-      const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut
-      if (shouldReconnect) {
-        startSock()
-      } else {
-        isConnected = false
-        try {
-          fs.unlinkSync('./session.json')
-        } catch {}
-      }
-    } else if (connection === 'open') {
-      isConnected = true
-      qrData = null
-    }
-  })
-
-  sock.ev.on('creds.update', saveState)
+    client.ev.on('creds.update', saveState);
 }
 
-startSock()
+connectToWhatsApp();
 
-app.get('/', (req, res) => {
-  res.send('WhatsBulk Backend Running ✅')
-})
-
-app.get('/connect', async (req, res) => {
-  if (isConnected) {
-    return res.json({ status: 'connected' })
-  } else if (qrData) {
-    try {
-      const qrImage = await qrcode.toDataURL(qrData)
-      return res.json({ status: 'pending', qr: qrImage })
-    } catch (err) {
-      return res.status(500).json({ error: 'QR generation failed' })
+app.get('/qr', async (req, res) => {
+    if (qr) {
+        const qrImage = await qrcode.toDataURL(qr);
+        res.json({ qr: qrImage });
+    } else {
+        res.status(404).json({ error: 'QR not available' });
     }
-  } else {
-    return res.json({ status: 'starting' })
-  }
-})
+});
+
+app.get('/status', (req, res) => {
+    res.json({ status });
+});
 
 app.post('/send', async (req, res) => {
-  if (!isConnected || !sock) {
-    return res.status(400).json({ error: 'Not connected' })
-  }
-
-  const { numbers, message } = req.body
-  if (!Array.isArray(numbers) || !message) {
-    return res.status(400).json({ error: 'Invalid input' })
-  }
-
-  try {
-    for (const number of numbers) {
-      const jid = number.includes('@s.whatsapp.net') ? number : number + '@s.whatsapp.net'
-      await sock.sendMessage(jid, { text: message })
+    if (status !== 'connected') {
+        return res.status(400).json({ error: 'WhatsApp not connected' });
     }
 
-    res.json({ status: 'messages sent' })
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to send message', detail: err.message })
-  }
-})
+    const { numbers, message } = req.body;
+    if (!numbers || !message) {
+        return res.status(400).json({ error: 'Numbers and message are required' });
+    }
 
-const PORT = process.env.PORT || 8080
-app.listen(PORT, () => {
-  console.log(`✅ Server running on ${PORT}`)
-})
+    try {
+        const results = [];
+        for (const number of numbers) {
+            const formattedNumber = number.includes('@') ? number : `${number}@s.whatsapp.net`;
+            try {
+                await client.sendMessage(formattedNumber, { text: message });
+                results.push({ number, status: 'success' });
+            } catch (error) {
+                results.push({ number, status: 'error', error: error.message });
+            }
+        }
+        res.json({ success: true, results });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.listen(port, () => {
+    console.log(`Server running on port ${port}`);
+});
