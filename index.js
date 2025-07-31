@@ -1,114 +1,96 @@
-const express = require('express');
-const { default: makeWASocket, useSingleFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
-const qrcode = require('qrcode');
-const { Boom } = require('@hapi/boom');
-const cors = require('cors');
-const fs = require('fs');
+import express from 'express'
+import makeWASocket, { useSingleFileAuthState, DisconnectReason } from '@whiskeysockets/baileys'
+import qrcode from 'qrcode'
+import cors from 'cors'
+import { Boom } from '@hapi/boom'
+import { unlinkSync } from 'fs'
 
-const app = express();
-const PORT = process.env.PORT || 8080;
+const { state, saveState } = useSingleFileAuthState('./session.json')
 
-app.use(cors());
-app.use(express.json());
+const app = express()
+app.use(cors())
+app.use(express.json())
 
-let qrCodeImageUrl = null;
-let sessionReady = false;
+let sock = null
+let isConnected = false
+let qrData = null
 
-// Auth state stored in session.json
-const { state, saveState } = useSingleFileAuthState('./session.json');
-
-// Start WhatsApp socket
-const startSock = () => {
-  const sock = makeWASocket({
+async function startSock() {
+  sock = makeWASocket({
     auth: state,
-    printQRInTerminal: false,
-  });
+    printQRInTerminal: false
+  })
 
-  // Listen for connection updates
-  sock.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect, qr } = update;
+  sock.ev.on('connection.update', (update) => {
+    const { connection, lastDisconnect, qr } = update
 
     if (qr) {
-      try {
-        qrCodeImageUrl = await qrcode.toDataURL(qr); // convert QR to base64 image
-        console.log("📲 QR Code generated");
-      } catch (err) {
-        console.error("❌ Failed to generate QR:", err);
-      }
+      qrData = qr
     }
 
     if (connection === 'close') {
-      const reason = new Boom(lastDisconnect?.error)?.output?.statusCode;
-      const shouldReconnect = reason !== DisconnectReason.loggedOut;
-      console.log("⚠️ Connection closed. Reconnecting:", shouldReconnect);
-      if (shouldReconnect) startSock();
+      const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut
+      if (shouldReconnect) {
+        startSock()
+      } else {
+        isConnected = false
+        try {
+          unlinkSync('./session.json')
+        } catch {}
+      }
+    } else if (connection === 'open') {
+      isConnected = true
+      qrData = null
     }
+  })
 
-    if (connection === 'open') {
-      sessionReady = true;
-      qrCodeImageUrl = null; // clear QR
-      console.log('✅ WhatsApp Connected');
-    }
-  });
+  sock.ev.on('creds.update', saveState)
+}
 
-  // Save session credentials on update
-  sock.ev.on('creds.update', saveState);
+startSock()
 
-  // Listen for messages (optional for logging)
-  sock.ev.on('messages.upsert', async ({ messages }) => {
-    const msg = messages[0];
-    if (!msg.key.fromMe) {
-      console.log("📩 Message from:", msg.key.remoteJid, "->", msg.message?.conversation);
-    }
-  });
+app.get('/', (req, res) => {
+  res.send('WhatsBulk Backend Running ✅')
+})
 
-  // Attach to global
-  global.sock = sock;
-};
-
-// Start the socket
-startSock();
-
-// GET QR Code and connection status
-app.get('/connect', (req, res) => {
-  if (sessionReady) {
-    return res.json({ status: 'connected' });
-  } else if (qrCodeImageUrl) {
-    return res.json({ status: 'disconnected', qr: qrCodeImageUrl });
-  } else {
-    return res.json({ status: 'pending' });
-  }
-});
-
-// POST to send message
-app.post('/send', async (req, res) => {
-  const { numbers, message } = req.body;
-
-  if (!sessionReady || !global.sock) {
-    return res.status(400).json({ error: 'WhatsApp not connected' });
-  }
-
-  if (!numbers || !Array.isArray(numbers) || numbers.length === 0 || !message) {
-    return res.status(400).json({ error: 'Invalid payload' });
-  }
-
-  const results = [];
-
-  for (let number of numbers.slice(0, 50)) {
-    const jid = number.includes('@s.whatsapp.net') ? number : `${number}@s.whatsapp.net`;
-
+app.get('/connect', async (req, res) => {
+  if (isConnected) {
+    return res.json({ status: 'connected' })
+  } else if (qrData) {
     try {
-      await global.sock.sendMessage(jid, { text: message });
-      results.push({ number, status: 'sent' });
-    } catch (error) {
-      results.push({ number, status: 'failed', error: error.message });
+      const qrImage = await qrcode.toDataURL(qrData)
+      return res.json({ status: 'pending', qr: qrImage })
+    } catch (err) {
+      return res.status(500).json({ error: 'QR generation failed' })
     }
+  } else {
+    return res.json({ status: 'starting' })
+  }
+})
+
+app.post('/send', async (req, res) => {
+  if (!isConnected || !sock) {
+    return res.status(400).json({ error: 'Not connected' })
   }
 
-  res.json({ status: 'ok', results });
-});
+  const { numbers, message } = req.body
+  if (!Array.isArray(numbers) || !message) {
+    return res.status(400).json({ error: 'Invalid input' })
+  }
 
-// Start server
+  try {
+    for (const number of numbers) {
+      const jid = number.includes('@s.whatsapp.net') ? number : number + '@s.whatsapp.net'
+      await sock.sendMessage(jid, { text: message })
+    }
+
+    res.json({ status: 'messages sent' })
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to send message', detail: err.message })
+  }
+})
+
+const PORT = process.env.PORT || 8080
 app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-});
+  console.log(`✅ Server running on ${PORT}`)
+})
