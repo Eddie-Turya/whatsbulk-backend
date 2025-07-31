@@ -1,78 +1,81 @@
-const { Client, LocalAuth } = require('whatsapp-web.js');
-const express = require('express');
-const qrcode = require('qrcode');
-const cors = require('cors');
-const bodyParser = require('body-parser');
-
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require("@whiskeysockets/baileys");
+const express = require("express");
+const QRCode = require("qrcode");
+const fs = require("fs");
 const app = express();
-app.use(cors());
-app.use(bodyParser.json());
+const PORT = process.env.PORT || 8080;
 
-const sessions = {};
+app.use(express.json());
 
-app.post('/create-session', async (req, res) => {
-  const { userId } = req.body;
+let sock;
+let qrCodeData = null;
+let isConnected = false;
 
-  if (!userId) return res.status(400).json({ error: "Missing userId" });
+async function startSock() {
+  const { state, saveCreds } = await useMultiFileAuthState("auth");
 
-  if (sessions[userId]) {
-    return res.json({ message: "Already connected" });
+  sock = makeWASocket({
+    auth: state,
+    printQRInTerminal: true,
+  });
+
+  sock.ev.on("connection.update", async (update) => {
+    const { connection, qr } = update;
+
+    if (qr) {
+      qrCodeData = await QRCode.toDataURL(qr);
+    }
+
+    if (connection === "open") {
+      console.log("✅ WhatsApp Connected");
+      isConnected = true;
+    }
+
+    if (connection === "close") {
+      isConnected = false;
+      qrCodeData = null;
+      if (update.lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut) {
+        startSock(); // auto reconnect
+      }
+    }
+  });
+
+  sock.ev.on("creds.update", saveCreds);
+}
+
+startSock();
+
+app.get("/connect", async (req, res) => {
+  if (isConnected) {
+    return res.json({ status: "connected" });
   }
-
-  let qrSent = false;
-
-  const client = new Client({
-    authStrategy: new LocalAuth({ clientId: userId }),
-    puppeteer: {
-      headless: true,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--disable-software-rasterizer'
-      ]
-    }
-  });
-
-  client.on('qr', async (qr) => {
-    if (!qrSent) {
-      qrSent = true;
-      const qrImage = await qrcode.toDataURL(qr);
-      res.json({ qr: qrImage });
-    }
-  });
-
-  client.on('ready', () => {
-    console.log(`✅ WhatsApp connected for ${userId}`);
-    sessions[userId] = client;
-    if (!qrSent) res.json({ message: "Already connected" });
-  });
-
-  client.on('auth_failure', (msg) => {
-    console.error('❌ Auth failure:', msg);
-    res.status(401).json({ error: "Authentication failed" });
-  });
-
-  client.initialize();
+  if (qrCodeData) {
+    return res.json({ qr: qrCodeData });
+  }
+  return res.json({ status: "pending" });
 });
 
-app.post('/send', async (req, res) => {
-  const { userId, message, numbers } = req.body;
-  const client = sessions[userId];
+app.post("/send", async (req, res) => {
+  if (!isConnected) {
+    return res.status(400).json({ error: "WhatsApp not connected." });
+  }
 
-  if (!client) return res.status(400).json({ error: "Client not connected" });
+  const { numbers, message } = req.body;
+
+  if (!Array.isArray(numbers) || !message) {
+    return res.status(400).json({ error: "Invalid input." });
+  }
 
   try {
-    for (let number of numbers) {
-      let phone = number.includes('@c.us') ? number : `${number}@c.us`;
-      await client.sendMessage(phone, message);
+    for (const num of numbers.slice(0, 50)) {
+      const jid = num.includes("@s.whatsapp.net") ? num : `${num}@s.whatsapp.net`;
+      await sock.sendMessage(jid, { text: message });
     }
-    res.json({ status: "Messages sent" });
-  } catch (e) {
-    res.status(500).json({ error: "Failed to send messages" });
+    return res.json({ success: true, sent: numbers.length });
+  } catch (err) {
+    console.error("Send error:", err);
+    return res.status(500).json({ error: "Send failed." });
   }
 });
 
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`Server running on ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Server running on ${PORT}`));
